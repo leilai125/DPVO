@@ -213,7 +213,6 @@ def main():
             raw_path,
             alignment="7dof",
         )
-        save_kitti_trajectory(aligned_poses, str(aligned_path))
 
         save_trajectory_route_plot(
             before_dir,
@@ -224,25 +223,33 @@ def main():
             save_path=before_plot_dir / f"{scene}.png",
             dpi=args.plot_dpi,
         )
-        save_trajectory_route_plot(
-            after_dir,
-            gt_dir,
-            sequence=scene,
-            method_name="DPVO (Sim(3) aligned)",
-            color="tab:blue",
-            save_path=after_plot_dir / f"{scene}.png",
-            dpi=args.plot_dpi,
-        )
+
+        if aligned_poses is None:
+            sim3_result = None
+            print(f"[{scene}] Sim(3) alignment unavailable: trajectory has no positional spread")
+        else:
+            assert aligned_poses is not None and sim3 is not None
+            save_kitti_trajectory(aligned_poses, str(aligned_path))
+            save_trajectory_route_plot(
+                after_dir,
+                gt_dir,
+                sequence=scene,
+                method_name="DPVO (Sim(3) aligned)",
+                color="tab:blue",
+                save_path=after_plot_dir / f"{scene}.png",
+                dpi=args.plot_dpi,
+            )
+            sim3_result = {
+                "scale": sim3["scale"],
+                "rotation": sim3["rotation"].tolist(),
+                "translation": sim3["translation"].tolist(),
+            }
 
         scene_metrics[scene] = {
             "num_poses": image_counts[scene],
             "before_alignment": before_metrics,
             "after_alignment": after_metrics,
-            "sim3": {
-                "scale": sim3["scale"],
-                "rotation": sim3["rotation"].tolist(),
-                "translation": sim3["translation"].tolist(),
-            },
+            "sim3": sim3_result,
         }
         print(format_trajectory_metrics(f"{scene} before alignment", before_metrics))
         print(format_trajectory_metrics(f"{scene} after Sim(3)", after_metrics))
@@ -252,15 +259,18 @@ def main():
     metric_names = ("ave_translation", "ave_rotation", "ate", "ave_scale_error")
     averages = {}
     for alignment in ("before_alignment", "after_alignment"):
-        averages[alignment] = {
-            metric: float(
-                np.nanmean([
-                    scene_metrics[scene][alignment][metric]
-                    for scene in scenes
-                ])
+        averages[alignment] = {}
+        for metric in metric_names:
+            available_values = [
+                scene_metrics[scene][alignment][metric]
+                for scene in scenes
+                if scene_metrics[scene][alignment][metric] is not None
+            ]
+            averages[alignment][metric] = (
+                float(np.mean(available_values))
+                if available_values
+                else None
             )
-            for metric in metric_names
-        }
 
     print("\nAggregate metrics")
     print(format_trajectory_metrics("Average before alignment", averages["before_alignment"]))

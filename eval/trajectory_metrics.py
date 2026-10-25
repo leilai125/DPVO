@@ -19,6 +19,8 @@ CameraMotion = Tuple[np.ndarray, np.ndarray]
 CameraMotionPredictions = Dict[str, Sequence[CameraMotion]]
 NedMotionPredictions = Dict[str, Sequence[np.ndarray]]
 PathLike = Union[str, Path]
+MetricValues = Dict[str, Optional[float]]
+ZERO_TRANSLATION_TOLERANCE = 1e-8
 NED_TO_CAMERA = np.array(
     [
         [0.0, 1.0, 0.0],
@@ -110,8 +112,8 @@ def kitti_rows_to_matrices(rows: np.ndarray) -> np.ndarray:
 def align_trajectory_sim3(
     poses_pred: np.ndarray,
     poses_gt: np.ndarray,
-) -> Tuple[np.ndarray, Dict[str, Union[float, np.ndarray]]]:
-    """Align camera-to-world poses with the global Sim(3) used by DPVO/evo."""
+) -> Optional[Tuple[np.ndarray, Dict[str, Union[float, np.ndarray]]]]:
+    """Align poses with Sim(3), or return None when scale is unobservable."""
     poses_pred = np.asarray(poses_pred, dtype=np.float64)
     poses_gt = np.asarray(poses_gt, dtype=np.float64)
     if poses_pred.shape != poses_gt.shape or poses_pred.ndim != 3 or poses_pred.shape[1:] != (4, 4):
@@ -124,6 +126,17 @@ def align_trajectory_sim3(
 
     pred_xyz = poses_pred[:, :3, 3].T
     gt_xyz = poses_gt[:, :3, 3].T
+    pred_spread = np.sqrt(np.mean(np.sum(
+        (pred_xyz - pred_xyz.mean(axis=1, keepdims=True)) ** 2,
+        axis=0,
+    )))
+    gt_spread = np.sqrt(np.mean(np.sum(
+        (gt_xyz - gt_xyz.mean(axis=1, keepdims=True)) ** 2,
+        axis=0,
+    )))
+    if pred_spread <= ZERO_TRANSLATION_TOLERANCE or gt_spread <= ZERO_TRANSLATION_TOLERANCE:
+        return None
+
     rotation, translation, scale = umeyama_alignment(pred_xyz, gt_xyz, with_scale=True)
 
     aligned = poses_pred.copy()
@@ -142,7 +155,7 @@ def align_trajectory_sim3(
 def compute_trajectory_metrics(
     poses_gt: np.ndarray,
     poses_pred: np.ndarray,
-) -> Dict[str, float]:
+) -> MetricValues:
     """Compute the metrics used by the copied DiffVO KITTI evaluator."""
     poses_gt = np.asarray(poses_gt, dtype=np.float64)
     poses_pred = np.asarray(poses_pred, dtype=np.float64)
@@ -166,15 +179,15 @@ def compute_trajectory_metrics(
         "ave_translation": (
             float(translation_error * 100.0)
             if translation_error is not None
-            else float("nan")
+            else None
         ),
         "ave_rotation": (
             float(rotation_error / np.pi * 180.0 * 100.0)
             if rotation_error is not None
-            else float("nan")
+            else None
         ),
         "ate": float(evaluator.compute_ATE(gt_dict, pred_dict)),
-        "ave_scale_error": float(evaluator.compute_ASE(gt_dict, pred_dict)),
+        "ave_scale_error": evaluator.compute_ASE(gt_dict, pred_dict),
     }
 
 
@@ -183,7 +196,11 @@ def evaluate_trajectory_files(
     pred_path: PathLike,
     *,
     alignment: Optional[str] = None,
-) -> Tuple[Dict[str, float], np.ndarray, Dict[str, Union[float, np.ndarray]]]:
+) -> Tuple[
+    MetricValues,
+    Optional[np.ndarray],
+    Optional[Dict[str, Union[float, np.ndarray]]],
+]:
     """Evaluate one KITTI-format trajectory and return the evaluated poses."""
     poses_gt = kitti_rows_to_matrices(load_kitti_trajectory(gt_path))
     poses_pred = kitti_rows_to_matrices(load_kitti_trajectory(pred_path))
@@ -193,25 +210,37 @@ def evaluate_trajectory_files(
             f"prediction has {len(poses_pred)} poses, ground truth has {len(poses_gt)}"
         )
 
-    alignment_data: Dict[str, Union[float, np.ndarray]] = {}
     if alignment is None:
         evaluated_poses = poses_pred
+        alignment_data: Dict[str, Union[float, np.ndarray]] = {}
     elif alignment == "7dof":
-        evaluated_poses, alignment_data = align_trajectory_sim3(poses_pred, poses_gt)
+        alignment_result = align_trajectory_sim3(poses_pred, poses_gt)
+        if alignment_result is None:
+            return {
+                "ave_translation": None,
+                "ave_rotation": None,
+                "ate": None,
+                "ave_scale_error": None,
+            }, None, None
+        evaluated_poses, alignment_data = alignment_result
     else:
         raise ValueError(f"Unsupported alignment {alignment!r}; expected None or '7dof'")
 
     return compute_trajectory_metrics(poses_gt, evaluated_poses), evaluated_poses, alignment_data
 
 
-def format_trajectory_metrics(label: str, metrics: Dict[str, float]) -> str:
+def format_trajectory_metrics(label: str, metrics: MetricValues) -> str:
     """Format trajectory metrics consistently with model_evaluator.py."""
+    translation = metrics.get("ave_translation")
+    rotation = metrics.get("ave_rotation")
+    ate = metrics.get("ate")
+    scale_error = metrics.get("ave_scale_error")
     return (
         f"{label:<24}: "
-        f"ave_translation={metrics.get('ave_translation', float('nan')):.4f}, "
-        f"ave_rotation={metrics.get('ave_rotation', float('nan')):.4f}, "
-        f"ate={metrics.get('ate', float('nan')):.4f}, "
-        f"ave_scale_error={metrics.get('ave_scale_error', float('nan')):.4f}"
+        f"ave_translation={'N/A' if translation is None else f'{translation:.4f}'}, "
+        f"ave_rotation={'N/A' if rotation is None else f'{rotation:.4f}'}, "
+        f"ate={'N/A' if ate is None else f'{ate:.4f}'}, "
+        f"ave_scale_error={'N/A' if scale_error is None else f'{scale_error:.4f}'}"
     )
 
 
@@ -220,7 +249,7 @@ def compute_average_trajectory_metrics(
     pred_dir: PathLike,
     *,
     alignment: Optional[str] = None,
-) -> Dict[str, float]:
+) -> MetricValues:
     gt_dir = Path(gt_dir)
     pred_dir = Path(pred_dir)
     metric_values: Dict[str, List[float]] = {
@@ -229,19 +258,22 @@ def compute_average_trajectory_metrics(
         "ate": [],
         "ave_scale_error": [],
     }
+    prediction_count = 0
 
     for pred_path in sorted(pred_dir.glob("*.txt")):
+        prediction_count += 1
         gt_path = gt_dir / pred_path.name
         if not gt_path.is_file():
             raise FileNotFoundError(f"Missing GT trajectory for prediction {pred_path.name}: {gt_path}")
         metrics, _, _ = evaluate_trajectory_files(gt_path, pred_path, alignment=alignment)
         for key, value in metrics.items():
-            metric_values[key].append(value)
+            if value is not None:
+                metric_values[key].append(value)
 
-    if not metric_values["ate"]:
+    if prediction_count == 0:
         return {}
     return {
-        key: float(np.nanmean(values)) if not np.all(np.isnan(values)) else float("nan")
+        key: float(np.mean(values)) if values else None
         for key, values in metric_values.items()
     }
 

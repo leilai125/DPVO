@@ -174,7 +174,7 @@ def save_trajectory_route_plots(
 def compute_metrics(
     gt_dir: str,
     pred_dir: str,
-) -> Dict[str, float]:
+) -> Dict[str, Optional[float]]:
     evaluator = KittiEvalOdom()
     evaluator.alignment = None
     gt_dir = Path(gt_dir)
@@ -202,13 +202,15 @@ def compute_metrics(
             metric_values["ave_rotation"].append(float(ave_r_err / np.pi * 180.0 * 100.0))
 
         metric_values["ate"].append(float(evaluator.compute_ATE(poses_gt, poses_pred)))
-        metric_values["ave_scale_error"].append(float(evaluator.compute_ASE(poses_gt, poses_pred)))
+        scale_error = evaluator.compute_ASE(poses_gt, poses_pred)
+        if scale_error is not None:
+            metric_values["ave_scale_error"].append(scale_error)
 
     if len(metric_values["ate"]) == 0:
         return {}
 
     return {
-        key: float(np.mean(values)) if len(values) > 0 else float("nan")
+        key: float(np.mean(values)) if values else None
         for key, values in metric_values.items()
     }
 
@@ -663,47 +665,43 @@ class KittiEvalOdom():
         return rpe_trans, rpe_rot
 
     def compute_ASE(self, gt, pred):
-        """Compute ASE
+        """Compute ASE, returning None when every frame pair is stationary.
         Args:
             gt (4x4 array dict): ground-truth poses
             pred (4x4 array dict): predicted poses
         Returns:
             ase
         """
-        if self.alignment != None:
-            return 0
-
-        eps = 0.0001
+        zero_tolerance = 1e-8
         scale_errors = []
         for i in list(pred.keys())[:-1]:
             gt1 = gt[i]
             gt2 = gt[i+1]
             gt_rel = np.linalg.inv(gt1) @ gt2
             gt_rel_trans = gt_rel[:,-1][:3]
-            # print(np.linalg.norm(gt_rel_trans))
-            # print(np.sqrt(gt_rel_trans[0]**2+gt_rel_trans[1]**2+gt_rel_trans[2]**2))
-            assert abs(np.linalg.norm(gt_rel_trans)-np.sqrt(gt_rel_trans[0]**2+gt_rel_trans[1]**2+gt_rel_trans[2]**2)) < 0.00000001
             gt_rel_trans_norm = np.linalg.norm(gt_rel_trans)
             
             pred1 = pred[i]
             pred2 = pred[i+1]
             pred_rel = np.linalg.inv(pred1) @ pred2
             pred_rel_trans = pred_rel[:,-1][:3]
-            assert abs(np.linalg.norm(pred_rel_trans)-np.sqrt(pred_rel_trans[0]**2+pred_rel_trans[1]**2+pred_rel_trans[2]**2)) < 0.00000001
             pred_rel_trans_norm = np.linalg.norm(pred_rel_trans)
 
-            scale_error = 1 - min((gt_rel_trans_norm+eps)/(pred_rel_trans_norm+eps), (pred_rel_trans_norm+eps)/(gt_rel_trans_norm+eps))
-
-            if gt_rel_trans_norm <= 0.01:
-                pass
+            gt_is_zero = gt_rel_trans_norm <= zero_tolerance
+            pred_is_zero = pred_rel_trans_norm <= zero_tolerance
+            if gt_is_zero and pred_is_zero:
+                continue
+            if gt_is_zero or pred_is_zero:
+                scale_errors.append(1.0)
             else:
-                scale_errors.append(scale_error)
-            
-        if len(scale_errors) == 0:
-            return 0
-        else:
-            ase = np.mean(np.asarray(scale_errors))
-            return ase
+                scale_errors.append(
+                    1.0 - min(
+                        gt_rel_trans_norm / pred_rel_trans_norm,
+                        pred_rel_trans_norm / gt_rel_trans_norm,
+                    )
+                )
+
+        return float(np.mean(scale_errors)) if scale_errors else None
 
     def scale_optimization(self, gt, pred):
         """ Optimize scaling factor
@@ -900,7 +898,7 @@ class KittiEvalOdom():
                             trans_err,
                             rot_err,
                             round(ate, 2),
-                            round(ase, 2),
+                            round(ase, 2) if ase is not None else None,
                         ]
 
             # Compute RPE
