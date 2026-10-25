@@ -200,3 +200,10 @@ python train.py --steps=240000 --lr=0.00008 --name=<your name>
 
 ## Acknowledgements
 * Our Viewer is adapted from DSO.
+
+
+python -u run_dataset_vo.py \
+    --dataset-root /data_ssd/lei/KITTI_dataset/dataset/sequences \
+    --intrinsics-json /home/lyam/workspace/DPVO/calib/kitti_gt_K.json \
+    --gt-dir /data_ssd/lei/KITTI_dataset/dataset/poses \
+    --overwrite

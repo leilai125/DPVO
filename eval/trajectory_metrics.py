@@ -4,11 +4,15 @@ import os
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
+import matplotlib
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from framework.eval.vo_eval_utils import KittiEvalOdom
-from framework.utils.plotting import get_pyplot
+from .vo_eval_utils import KittiEvalOdom, umeyama_alignment
+
+
+matplotlib.use("Agg")
+from matplotlib import pyplot as plt
 
 
 CameraMotion = Tuple[np.ndarray, np.ndarray]
@@ -82,12 +86,133 @@ def load_kitti_trajectory(path: PathLike) -> np.ndarray:
     if not path.is_file():
         raise FileNotFoundError(f"Pose file not found: {path}")
 
-    poses = np.loadtxt(path, dtype=np.float32)
+    poses = np.loadtxt(path, dtype=np.float64)
     if poses.ndim == 1:
         poses = poses[None, :]
     if poses.ndim != 2 or poses.shape[1] < 12:
         raise ValueError(f"Unexpected pose format in {path}. Expected Nx12+, got {poses.shape}.")
     return poses
+
+
+def kitti_rows_to_matrices(rows: np.ndarray) -> np.ndarray:
+    """Convert an N x 12 KITTI trajectory into N homogeneous poses."""
+    rows = np.asarray(rows, dtype=np.float64)
+    if rows.ndim == 1:
+        rows = rows[None, :]
+    if rows.ndim != 2 or rows.shape[1] < 12:
+        raise ValueError(f"Expected an N x 12+ KITTI trajectory, got {rows.shape}")
+
+    poses = np.repeat(np.eye(4, dtype=np.float64)[None], len(rows), axis=0)
+    poses[:, :3, :] = rows[:, :12].reshape(-1, 3, 4)
+    return poses
+
+
+def align_trajectory_sim3(
+    poses_pred: np.ndarray,
+    poses_gt: np.ndarray,
+) -> Tuple[np.ndarray, Dict[str, Union[float, np.ndarray]]]:
+    """Align camera-to-world poses with the global Sim(3) used by DPVO/evo."""
+    poses_pred = np.asarray(poses_pred, dtype=np.float64)
+    poses_gt = np.asarray(poses_gt, dtype=np.float64)
+    if poses_pred.shape != poses_gt.shape or poses_pred.ndim != 3 or poses_pred.shape[1:] != (4, 4):
+        raise ValueError(
+            "Prediction and ground truth must both have shape N x 4 x 4; "
+            f"got {poses_pred.shape} and {poses_gt.shape}"
+        )
+    if len(poses_pred) < 2:
+        raise ValueError("At least two poses are required for Sim(3) alignment")
+
+    pred_xyz = poses_pred[:, :3, 3].T
+    gt_xyz = poses_gt[:, :3, 3].T
+    rotation, translation, scale = umeyama_alignment(pred_xyz, gt_xyz, with_scale=True)
+
+    aligned = poses_pred.copy()
+    aligned[:, :3, :3] = np.einsum("ij,njk->nik", rotation, poses_pred[:, :3, :3])
+    aligned[:, :3, 3] = (
+        scale * (rotation @ poses_pred[:, :3, 3].T)
+        + translation[:, None]
+    ).T
+    return aligned, {
+        "scale": float(scale),
+        "rotation": rotation,
+        "translation": translation,
+    }
+
+
+def compute_trajectory_metrics(
+    poses_gt: np.ndarray,
+    poses_pred: np.ndarray,
+) -> Dict[str, float]:
+    """Compute the metrics used by the copied DiffVO KITTI evaluator."""
+    poses_gt = np.asarray(poses_gt, dtype=np.float64)
+    poses_pred = np.asarray(poses_pred, dtype=np.float64)
+    if poses_gt.shape != poses_pred.shape or poses_gt.ndim != 3 or poses_gt.shape[1:] != (4, 4):
+        raise ValueError(
+            "Prediction and ground truth must both have shape N x 4 x 4; "
+            f"got {poses_pred.shape} and {poses_gt.shape}"
+        )
+
+    evaluator = KittiEvalOdom()
+    gt_dict = {index: pose for index, pose in enumerate(poses_gt)}
+    pred_dict = {index: pose for index, pose in enumerate(poses_pred)}
+    sequence_errors = evaluator.calc_sequence_errors(gt_dict, pred_dict)
+    translation_error, rotation_error = evaluator.compute_overall_err(sequence_errors)
+
+    # The poses have already been transformed when alignment is requested. Keep
+    # alignment unset so ASE measures residual local scale drift instead of
+    # being forced to zero by the legacy evaluator.
+    evaluator.alignment = None
+    return {
+        "ave_translation": (
+            float(translation_error * 100.0)
+            if translation_error is not None
+            else float("nan")
+        ),
+        "ave_rotation": (
+            float(rotation_error / np.pi * 180.0 * 100.0)
+            if rotation_error is not None
+            else float("nan")
+        ),
+        "ate": float(evaluator.compute_ATE(gt_dict, pred_dict)),
+        "ave_scale_error": float(evaluator.compute_ASE(gt_dict, pred_dict)),
+    }
+
+
+def evaluate_trajectory_files(
+    gt_path: PathLike,
+    pred_path: PathLike,
+    *,
+    alignment: Optional[str] = None,
+) -> Tuple[Dict[str, float], np.ndarray, Dict[str, Union[float, np.ndarray]]]:
+    """Evaluate one KITTI-format trajectory and return the evaluated poses."""
+    poses_gt = kitti_rows_to_matrices(load_kitti_trajectory(gt_path))
+    poses_pred = kitti_rows_to_matrices(load_kitti_trajectory(pred_path))
+    if len(poses_gt) != len(poses_pred):
+        raise ValueError(
+            f"Trajectory length mismatch for {pred_path}: "
+            f"prediction has {len(poses_pred)} poses, ground truth has {len(poses_gt)}"
+        )
+
+    alignment_data: Dict[str, Union[float, np.ndarray]] = {}
+    if alignment is None:
+        evaluated_poses = poses_pred
+    elif alignment == "7dof":
+        evaluated_poses, alignment_data = align_trajectory_sim3(poses_pred, poses_gt)
+    else:
+        raise ValueError(f"Unsupported alignment {alignment!r}; expected None or '7dof'")
+
+    return compute_trajectory_metrics(poses_gt, evaluated_poses), evaluated_poses, alignment_data
+
+
+def format_trajectory_metrics(label: str, metrics: Dict[str, float]) -> str:
+    """Format trajectory metrics consistently with model_evaluator.py."""
+    return (
+        f"{label:<24}: "
+        f"ave_translation={metrics.get('ave_translation', float('nan')):.4f}, "
+        f"ave_rotation={metrics.get('ave_rotation', float('nan')):.4f}, "
+        f"ate={metrics.get('ate', float('nan')):.4f}, "
+        f"ave_scale_error={metrics.get('ave_scale_error', float('nan')):.4f}"
+    )
 
 
 def compute_average_trajectory_metrics(
@@ -96,38 +221,29 @@ def compute_average_trajectory_metrics(
     *,
     alignment: Optional[str] = None,
 ) -> Dict[str, float]:
-    evaluator = KittiEvalOdom()
     gt_dir = Path(gt_dir)
     pred_dir = Path(pred_dir)
-
-    metric_sums = {
-        "ave_translation": 0.0,
-        "ave_rotation": 0.0,
-        "ate": 0.0,
-        "ave_scale_error": 0.0,
+    metric_values: Dict[str, List[float]] = {
+        "ave_translation": [],
+        "ave_rotation": [],
+        "ate": [],
+        "ave_scale_error": [],
     }
-    num_sequences = 0
 
     for pred_path in sorted(pred_dir.glob("*.txt")):
         gt_path = gt_dir / pred_path.name
         if not gt_path.is_file():
             raise FileNotFoundError(f"Missing GT trajectory for prediction {pred_path.name}: {gt_path}")
+        metrics, _, _ = evaluate_trajectory_files(gt_path, pred_path, alignment=alignment)
+        for key, value in metrics.items():
+            metric_values[key].append(value)
 
-        poses_gt = evaluator.load_poses_from_txt(str(gt_path))
-        poses_pred = evaluator.load_poses_from_txt(str(pred_path))
-        seq_err = evaluator.calc_sequence_errors(poses_gt, poses_pred)
-        ave_t_err, ave_r_err = evaluator.compute_overall_err(seq_err)
-
-        metric_sums["ave_translation"] += float(ave_t_err * 100.0)
-        metric_sums["ave_rotation"] += float(ave_r_err / np.pi * 180.0 * 100.0)
-        metric_sums["ate"] += float(evaluator.compute_ATE(poses_gt, poses_pred))
-        metric_sums["ave_scale_error"] += float(evaluator.compute_ASE(poses_gt, poses_pred))
-        num_sequences += 1
-
-    if num_sequences == 0:
+    if not metric_values["ate"]:
         return {}
-
-    return {key: value / num_sequences for key, value in metric_sums.items()}
+    return {
+        key: float(np.nanmean(values)) if not np.all(np.isnan(values)) else float("nan")
+        for key, values in metric_values.items()
+    }
 
 
 def extract_xz_coordinates(poses: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -183,8 +299,6 @@ def save_trajectory_route_plot(
     dpi: int = 150,
 ) -> str:
     """Save an X-Z trajectory plot for one sequence."""
-    plt = get_pyplot()
-
     pred_path = Path(pred_dir) / f"{sequence}.txt"
     gt_path = Path(gt_dir) / f"{sequence}.txt"
 
